@@ -1,0 +1,5 @@
+caldav>=1.4
+icalendar>=6.0
+python-dotenv>=1.0
+requests>=2.31
+python-dateutil>=2.9
