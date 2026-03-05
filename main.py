@@ -58,7 +58,7 @@ _notifications_sent = 0
 _muted_until: datetime | None = None
 
 # --- Default state schema ---
-_DEFAULT_STATE = {"sent": {}, "accepted": [], "asana_seen_tasks": []}
+_DEFAULT_STATE = {"sent": {}, "accepted": [], "asana_seen_tasks": [], "asana_hidden_tasks": []}
 
 
 # --- State ---
@@ -81,30 +81,32 @@ def save_state(state: dict):
 
 # --- Telegram ---
 
-def send_telegram(text: str) -> bool:
+def send_telegram(text: str, reply_markup: dict | None = None) -> dict | None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(
-        url,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-        },
-        timeout=10,
-    )
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    resp = requests.post(url, json=payload, timeout=10)
     if not resp.ok:
         log.error(f"Telegram error: {resp.status_code} {resp.text}")
-    return resp.ok
+        return None
+    return resp.json().get("result")
 
 
-def telegram_api(method: str, **kwargs) -> dict | None:
+def telegram_api(method: str, http_timeout: int = 10, **kwargs) -> dict | None:
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
     try:
-        resp = requests.post(url, json=kwargs, timeout=10)
+        resp = requests.post(url, json=kwargs, timeout=http_timeout)
         if resp.ok:
             return resp.json().get("result")
     except Exception as e:
-        log.error(f"Telegram API error ({method}): {e}")
+        if "Read timed out" not in str(e):
+            log.error(f"Telegram API error ({method}): {e}")
     return None
 
 
@@ -159,6 +161,26 @@ def asana_get_my_tasks() -> list[dict]:
     return []
 
 
+def asana_seed_seen_tasks():
+    """On first run, mark all existing tasks as seen (don't spam backlog)."""
+    if not ASANA_TOKEN or not ASANA_WORKSPACE_GID:
+        return
+
+    state = load_state()
+    if state.get("asana_seen_tasks"):
+        return  # already seeded
+
+    try:
+        tasks = asana_get_my_tasks()
+    except Exception as e:
+        log.error(f"Asana seed error: {e}")
+        return
+
+    state["asana_seen_tasks"] = [t["gid"] for t in tasks]
+    save_state(state)
+    log.info(f"Asana: seeded {len(tasks)} existing tasks as seen")
+
+
 def check_asana_new_tasks():
     """Check for newly assigned Asana tasks and notify."""
     if not ASANA_TOKEN or not ASANA_WORKSPACE_GID:
@@ -167,17 +189,22 @@ def check_asana_new_tasks():
     state = load_state()
     seen = set(state.get("asana_seen_tasks", []))
 
+    if not seen:
+        asana_seed_seen_tasks()
+        return
+
     try:
         tasks = asana_get_my_tasks()
     except Exception as e:
         log.error(f"Asana fetch error: {e}")
         return
 
-    for task in tasks:
-        gid = task["gid"]
-        if gid in seen:
-            continue
+    new_tasks = [t for t in tasks if t["gid"] not in seen]
+    if not new_tasks:
+        return
 
+    for task in new_tasks:
+        gid = task["gid"]
         name = task.get("name", "Без названия")
         url = task.get("permalink_url", "")
         due = task.get("due_on") or ""
@@ -195,8 +222,11 @@ def check_asana_new_tasks():
 
         send_telegram("\n".join(lines))
         log.info(f"Asana new task: {name}")
-
         seen.add(gid)
+
+    # Also add all current task GIDs (in case some were removed and re-added)
+    for t in tasks:
+        seen.add(t["gid"])
 
     state["asana_seen_tasks"] = list(seen)
     save_state(state)
@@ -686,47 +716,143 @@ def _cmd_status() -> str:
     return "\n".join(lines)
 
 
-def _cmd_tasks() -> str:
-    if not ASANA_TOKEN:
-        return "Asana не настроена"
-
+def _build_tasks_message(show_hidden: bool = False) -> tuple[str, dict | None]:
+    """Build tasks list text + inline keyboard. Returns (text, reply_markup)."""
     tasks = asana_get_my_tasks()
     if not tasks:
-        return "Нет открытых задач в Asana"
+        return "Нет открытых задач в Asana", None
 
-    # Split into with deadline and without
-    with_due = [t for t in tasks if t.get("due_on")]
-    no_due = [t for t in tasks if not t.get("due_on")]
+    state = load_state()
+    hidden = set(state.get("asana_hidden_tasks", []))
 
-    # Sort by deadline
+    if not show_hidden:
+        visible = [t for t in tasks if t["gid"] not in hidden]
+    else:
+        visible = tasks
+
+    if not visible:
+        return "Все задачи скрыты", {"inline_keyboard": [
+            [{"text": "Показать все", "callback_data": "tasks:all"}]
+        ]}
+
+    with_due = [t for t in visible if t.get("due_on")]
+    no_due = [t for t in visible if not t.get("due_on")]
     with_due.sort(key=lambda t: t["due_on"])
+    ordered = with_due + no_due
 
-    lines = [f"<b>Asana: {len(tasks)} задач</b>\n"]
+    hidden_count = len(tasks) - len([t for t in tasks if t["gid"] not in hidden])
+    header = f"<b>Asana: {len(visible)} задач</b>"
+    if hidden_count:
+        header += f" ({hidden_count} скрыто)"
+    lines = [header, ""]
 
-    if with_due:
-        lines.append("<b>С дедлайном:</b>")
-        for t in with_due:
-            due = t["due_on"]
-            url = t.get("permalink_url", "")
-            name = t.get("name", "?")
-            if url:
-                lines.append(f"  {due} — <a href=\"{url}\">{name}</a>")
-            else:
-                lines.append(f"  {due} — {name}")
+    buttons = []
+    idx = 1
+    for t in ordered:
+        gid = t["gid"]
+        due = t.get("due_on", "")
+        url = t.get("permalink_url", "")
+        name = t.get("name", "?")
+        is_hidden = gid in hidden
 
-    if no_due:
-        lines.append(f"\n<b>Без дедлайна ({len(no_due)}):</b>")
-        for t in no_due[:10]:
-            url = t.get("permalink_url", "")
-            name = t.get("name", "?")
-            if url:
-                lines.append(f"  <a href=\"{url}\">{name}</a>")
-            else:
-                lines.append(f"  {name}")
-        if len(no_due) > 10:
-            lines.append(f"  ... ещё {len(no_due) - 10}")
+        if is_hidden:
+            line = f"  <s>{idx}.</s> "
+        else:
+            line = f"  {idx}. "
 
-    return "\n".join(lines)
+        if due:
+            line += f"{due} — "
+        if url:
+            line += f"<a href=\"{url}\">{name}</a>"
+        else:
+            line += name
+        lines.append(line)
+
+        # Toggle button
+        if is_hidden:
+            buttons.append({"text": f"{idx} +", "callback_data": f"show:{gid}"})
+        else:
+            buttons.append({"text": f"{idx} x", "callback_data": f"hide:{gid}"})
+        idx += 1
+
+    # Arrange buttons in rows of 5
+    keyboard = [buttons[i:i+5] for i in range(0, len(buttons), 5)]
+
+    # Add "show all" / "show active" toggle
+    if show_hidden and hidden_count:
+        keyboard.append([{"text": "Только активные", "callback_data": "tasks:active"}])
+    elif hidden_count:
+        keyboard.append([{"text": "Показать все", "callback_data": "tasks:all"}])
+
+    return "\n".join(lines), {"inline_keyboard": keyboard}
+
+
+def _cmd_tasks_interactive(args: str = ""):
+    """Send tasks with inline buttons (called from command handler)."""
+    if not ASANA_TOKEN:
+        send_telegram("Asana не настроена")
+        return
+
+    show_hidden = args.strip() == "all"
+    text, markup = _build_tasks_message(show_hidden)
+    send_telegram(text, reply_markup=markup)
+
+
+def handle_callback_query(callback_query: dict):
+    """Handle inline button presses."""
+    cb_id = callback_query["id"]
+    data = callback_query.get("data", "")
+    message = callback_query.get("message", {})
+    chat_id = str(message.get("chat", {}).get("id", ""))
+    message_id = message.get("message_id")
+
+    if chat_id != TELEGRAM_CHAT_ID:
+        return
+
+    answer_text = ""
+
+    if data.startswith("hide:"):
+        gid = data[5:]
+        state = load_state()
+        hidden = state.setdefault("asana_hidden_tasks", [])
+        if gid not in hidden:
+            hidden.append(gid)
+            save_state(state)
+        answer_text = "Скрыта"
+
+    elif data.startswith("show:"):
+        gid = data[5:]
+        state = load_state()
+        hidden = state.get("asana_hidden_tasks", [])
+        if gid in hidden:
+            hidden.remove(gid)
+            state["asana_hidden_tasks"] = hidden
+            save_state(state)
+        answer_text = "Показана"
+
+    elif data == "tasks:all":
+        answer_text = ""
+    elif data == "tasks:active":
+        answer_text = ""
+
+    # Answer the callback
+    telegram_api("answerCallbackQuery", callback_query_id=cb_id, text=answer_text)
+
+    # Update the message with refreshed task list
+    show_all = data == "tasks:all"
+    text, markup = _build_tasks_message(show_hidden=show_all)
+
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if markup:
+        payload["reply_markup"] = json.dumps(markup)
+
+    telegram_api("editMessageText", **payload)
 
 
 def _cmd_help() -> str:
@@ -739,7 +865,7 @@ def _cmd_help() -> str:
     ]
     if ASANA_TOKEN:
         lines.append("\n<b>Asana:</b>")
-        lines.append("/tasks — мои задачи")
+        lines.append("/tasks — мои задачи (кнопки скрытия)")
     lines.extend([
         "\n<b>Управление:</b>",
         "/mute [часы] — выключить уведомления",
@@ -753,7 +879,7 @@ COMMANDS = {
     "/today": lambda args: _cmd_today(),
     "/tomorrow": lambda args: _cmd_tomorrow(),
     "/week": lambda args: _cmd_week(),
-    "/tasks": lambda args: _cmd_tasks(),
+    "/tasks": lambda args: _cmd_tasks_interactive(args),
     "/mute": lambda args: _cmd_mute(args),
     "/unmute": lambda args: _cmd_unmute(),
     "/status": lambda args: _cmd_status(),
@@ -772,9 +898,10 @@ def bot_polling_loop():
         try:
             result = telegram_api(
                 "getUpdates",
+                http_timeout=35,
                 offset=last_update_id + 1,
                 timeout=30,
-                allowed_updates=["message"],
+                allowed_updates=["message", "callback_query"],
             )
 
             if not result:
@@ -783,6 +910,16 @@ def bot_polling_loop():
 
             for update in result:
                 last_update_id = update["update_id"]
+
+                # Handle inline button callbacks
+                callback = update.get("callback_query")
+                if callback:
+                    try:
+                        handle_callback_query(callback)
+                    except Exception as e:
+                        log.error(f"Callback error: {e}", exc_info=True)
+                    continue
+
                 message = update.get("message")
                 if not message:
                     continue
@@ -806,7 +943,8 @@ def bot_polling_loop():
                 if handler:
                     try:
                         response = handler(args)
-                        send_telegram(response)
+                        if response:
+                            send_telegram(response)
                     except Exception as e:
                         log.error(f"Command {cmd} failed: {e}", exc_info=True)
                         send_telegram(f"Ошибка: {e}")
@@ -835,13 +973,9 @@ def check_and_notify():
     start = now - timedelta(minutes=2)
     end = now + timedelta(minutes=max_remind + 5)
 
-    # Periodic tasks every 5 minutes
+    # Periodic flag for accept (every 5 min)
     _accept_counter += 1
     periodic = _accept_counter % max(1, 300 // POLL_INTERVAL_SECONDS) == 0
-
-    if periodic:
-        check_asana_new_tasks()
-        check_asana_deadlines()
 
     try:
         if ICS_URL:
@@ -979,6 +1113,9 @@ def main():
         ],
     )
 
+    # Seed Asana tasks on first run (don't notify about existing backlog)
+    asana_seed_seen_tasks()
+
     send_telegram(
         "<b>Calendar Notifier запущен</b>\n\n"
         f"Напоминания: {', '.join(_human_time_delta(m) for m in REMIND_BEFORE_MINUTES)}\n"
@@ -998,6 +1135,15 @@ def main():
             check_and_notify()
         except Exception as e:
             log.error(f"Error in check loop: {e}", exc_info=True)
+
+        # Asana checks run separately (own state load/save, no conflicts)
+        if _accept_counter % max(1, 300 // POLL_INTERVAL_SECONDS) == 0:
+            try:
+                check_asana_new_tasks()
+                check_asana_deadlines()
+            except Exception as e:
+                log.error(f"Asana check error: {e}", exc_info=True)
+
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
